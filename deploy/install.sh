@@ -226,7 +226,7 @@ if [[ "$RELOCATE" == "true" && "$REPO_ROOT" != "$DEPLOY_DIR" && ! -f .env && -z 
       --exclude='./*.md' \
       . | (cd "$DEPLOY_DIR" && tar -xf -)
     export WA_RELOCATED=1
-    exec "$DEPLOY_DIR/deploy/install.sh" "$DOMAIN_INPUT" "$ADMIN_EMAIL"
+    exec bash "$DEPLOY_DIR/deploy/install.sh" "$DOMAIN_INPUT" "$ADMIN_EMAIL"
   fi
   echo "==> ${DEPLOY_DIR} is not creatable — deploying from ${REPO_ROOT} instead"
 fi
