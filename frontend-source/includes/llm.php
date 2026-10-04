@@ -882,7 +882,10 @@ function llmCallGoogle(array $auth, array $messages, array $options) {
 
     // The key goes in a header, not the query string: query strings end up in
     // access logs and proxy logs.
-    $url = rtrim($base, '/') . '/models/' . rawurlencode($auth['model']) . ':generateContent';
+    $maxTokens = max((int)($options['max_tokens'] ?? 400), 100);
+    $payload['generationConfig']['maxOutputTokens'] = $maxTokens;
+
+    $url = rtrim($base, '/') . '/models/' . rawurlencode($auth['model']) . ':generateContent?key=' . rawurlencode($auth['key']);
     [$status, $body, $err] = llmHttpJson($url, ['x-goog-api-key: ' . $auth['key']], $payload,
         (int)($options['timeout'] ?? 60));
 
@@ -894,13 +897,24 @@ function llmCallGoogle(array $auth, array $messages, array $options) {
 
     $text = '';
     foreach ($body['candidates'][0]['content']['parts'] ?? [] as $part) {
-        $text .= $part['text'] ?? '';
+        if (isset($part['text'])) $text .= $part['text'];
     }
     $text = trim($text);
+
+    $finishReason = $body['candidates'][0]['finishReason'] ?? null;
+    $errNote = null;
+    if ($text === '') {
+        if ($finishReason && $finishReason !== 'STOP') {
+            $errNote = 'Google model stopped with reason: ' . $finishReason;
+        } else {
+            $errNote = 'Empty completion';
+        }
+    }
+
     return [
         'ok' => $text !== '',
         'text' => $text,
-        'error' => $text === '' ? 'Empty completion' : null,
+        'error' => $errNote,
         'usage' => [
             'prompt' => (int)($body['usageMetadata']['promptTokenCount'] ?? 0),
             'completion' => (int)($body['usageMetadata']['candidatesTokenCount'] ?? 0),
@@ -1430,7 +1444,7 @@ function llmTranscribeGoogle(array $auth, $audioBytes, $filename = 'audio.ogg', 
         ],
     ];
 
-    $url = rtrim($base, '/') . '/models/' . rawurlencode($auth['model']) . ':generateContent';
+    $url = rtrim($base, '/') . '/models/' . rawurlencode($auth['model']) . ':generateContent?key=' . rawurlencode($auth['key']);
     [$status, $body, $err] = llmHttpJson($url, ['x-goog-api-key: ' . $auth['key']], $payload, 60);
 
     if ($err) return ['ok' => false, 'error' => llmScrubSecret($err, $auth['key']), 'text' => ''];
