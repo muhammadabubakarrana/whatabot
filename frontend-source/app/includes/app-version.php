@@ -12,8 +12,8 @@
 // in build.yml. It is public by design: it carries a version string and
 // release notes, nothing instance-specific.
 
-const APP_UPDATE_FEED_URL = 'https://raw.githubusercontent.com/shahzad11/whatsapp-saas-deploy/main/latest.json';
-const APP_UPDATE_COMMAND = 'curl -fsSL https://raw.githubusercontent.com/shahzad11/whatsapp-saas-deploy/main/deploy/update.sh | bash';
+const APP_UPDATE_FEED_URL = 'https://raw.githubusercontent.com/muhammadabubakarrana/whatabot/main/latest.json';
+const APP_UPDATE_COMMAND = 'curl -fsSL https://raw.githubusercontent.com/muhammadabubakarrana/whatabot/main/deploy/update.sh | bash';
 // Six hours: frequent enough that an admin sees a new release the same day,
 // rare enough that every sidebar render is not a network call (see the 'cached'
 // mode — the sidebar never fetches at all).
