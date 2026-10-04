@@ -645,7 +645,18 @@ function llmAudioEnabled(?mysqli $conn = null) {
 // rather than a per-tenant one: it is the platform owner who pays for it.
 function llmTranscribeModelId(?mysqli $conn = null) {
     $value = overrideSetting($conn, 'llm_transcribe_model_id');
-    return $value === null ? null : (int)$value;
+    if ($value === null) {
+        // No explicit transcription model chosen – pick a default Gemini model that supports audio.
+        $candidates = llmTranscribeCandidates($conn, false);
+        foreach ($candidates as $model) {
+            if ($model['provider_code'] === 'google') {
+                return (int)$model['id'];
+            }
+        }
+        // Fallback to first available candidate if no Google model found.
+        return $candidates ? (int)$candidates[0]['id'] : null;
+    }
+    return (int)$value;
 }
 
 // --- Calling a model --------------------------------------------------------
