@@ -93,7 +93,9 @@ function llmProviderCatalogue() {
             'transcribe' => true,
             'models'     => [
                 ['gemini-2.0-flash', 'Gemini 2.0 Flash', 'chat', ['audio']],
-                ['gemini-2.5-pro', 'Gemini 2.5 Pro', 'chat', ['audio']],
+                ['gemini-1.5-flash', 'Gemini 1.5 Flash', 'chat', ['audio']],
+                ['gemini-1.5-pro', 'Gemini 1.5 Pro', 'chat', ['audio']],
+                ['gemini-3.1-pro-preview', 'Gemini 3.1 Pro (Preview)', 'chat', ['audio']],
             ],
         ],
     ];
@@ -243,6 +245,7 @@ function llmModelTranscribes(array $model) {
     if (($model['kind'] ?? '') === 'transcribe') return true;
     $provider = $model['provider_code'] ?? '';
     $code = $model['model_code'] ?? '';
+    if ($provider === 'google' && str_starts_with($code, 'gemini')) return true;
     foreach (llmProviderCatalogue()[$provider]['models'] ?? [] as $entry) {
         if ($entry[0] === $code && in_array('audio', $entry[3] ?? [], true)) return true;
     }
