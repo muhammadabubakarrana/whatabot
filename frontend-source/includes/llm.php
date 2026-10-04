@@ -1490,7 +1490,24 @@ function llmTestProvider(mysqli $conn, $providerCode, $candidateKey = null, $can
     $models = llmModels($conn, 'chat', false);
     $model = null;
     foreach ($models as $m) {
-        if ($m['provider_code'] === $providerCode) { $model = $m['model_code']; break; }
+        if ($m['provider_code'] === $providerCode && !empty($m['is_enabled'])) {
+            $model = $m['model_code'];
+            break;
+        }
+    }
+    if ($model === null) {
+        foreach ($models as $m) {
+            if ($m['provider_code'] === $providerCode && $m['model_code'] !== 'gemini-2.0-flash' && $m['model_code'] !== 'gemini-2.5-pro') {
+                $model = $m['model_code'];
+                break;
+            }
+        }
+    }
+    if ($model === null) {
+        $catModels = llmProviderCatalogue()[$providerCode]['models'] ?? [];
+        if (!empty($catModels[0][0])) {
+            $model = $catModels[0][0];
+        }
     }
     if ($model === null) return [false, 'Add at least one chat model for this provider first.'];
 
@@ -1500,12 +1517,12 @@ function llmTestProvider(mysqli $conn, $providerCode, $candidateKey = null, $can
         'key' => $key,
         'base_url' => $candidateBaseUrl !== '' ? $candidateBaseUrl : llmProviderBaseUrl($provider),
         'model' => $model,
-    ], [['role' => 'user', 'content' => 'Reply with the single word: ok']], ['max_tokens' => 16]);
+    ], [['role' => 'user', 'content' => 'Reply with the single word: ok']], ['max_tokens' => 100]);
 
     llmRecordTest($conn, $providerCode, $result['ok'], $result['error'] ?? null);
 
     $tested = $candidateKey !== '' ? ' (unsaved key — Save to keep it)' : '';
     return [$result['ok'], $result['ok']
-        ? 'Replied in ' . $result['latency_ms'] . ' ms' . $tested
-        : $result['error'] . $tested];
+        ? 'Replied in ' . $result['latency_ms'] . ' ms (using ' . $model . ')' . $tested
+        : ($result['error'] ?: 'Empty completion') . ' (using ' . $model . ')' . $tested];
 }
