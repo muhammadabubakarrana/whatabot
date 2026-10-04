@@ -92,10 +92,11 @@ function llmProviderCatalogue() {
             'console_url' => 'https://aistudio.google.com/app/apikey',
             'transcribe' => true,
             'models'     => [
-                ['gemini-2.0-flash', 'Gemini 2.0 Flash', 'chat', ['audio']],
-                ['gemini-1.5-flash', 'Gemini 1.5 Flash', 'chat', ['audio']],
-                ['gemini-1.5-pro', 'Gemini 1.5 Pro', 'chat', ['audio']],
+                ['gemini-3.8-flash', 'Gemini 3.8 Flash', 'chat', ['audio']],
+                ['gemini-3.6-flash', 'Gemini 3.6 Flash', 'chat', ['audio']],
+                ['gemini-3.5-flash', 'Gemini 3.5 Flash', 'chat', ['audio']],
                 ['gemini-3.1-pro-preview', 'Gemini 3.1 Pro (Preview)', 'chat', ['audio']],
+                ['gemini-2.5-flash', 'Gemini 2.5 Flash', 'chat', ['audio']],
             ],
         ],
     ];
