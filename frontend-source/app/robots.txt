@@ -1,0 +1,21 @@
+# The public pages are crawlable — a domain with nothing in the index looks as
+# empty as one with only a login form. The credential and account-recovery
+# pages are disallowed: a sign-in form in search results is the phish pattern,
+# and none of them is useful search content anyway.
+User-agent: *
+Allow: /$
+Allow: /privacy.php
+Allow: /terms.php
+Allow: /contact.php
+Disallow: /login.php
+Disallow: /forgot-password.php
+Disallow: /reset-password.php
+Disallow: /resend-activation.php
+Disallow: /set-password.php
+Disallow: /activate.php
+Disallow: /confirm-email.php
+Disallow: /admin/
+Disallow: /ajax/
+Disallow: /internal/
+Disallow: /webhooks/
+Disallow: /whatsapp/

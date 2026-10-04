@@ -1,0 +1,351 @@
+<?php
+require_once dirname(__DIR__) . '/config/init.php';
+requireLogin();
+
+$userId = (int)$_SESSION['user_id'];
+$plan = getUserPlan($conn, $userId);
+$error = '';
+
+// Two modes on one page: ?account=ID edits an existing Cloud row, no
+// parameter creates one. The QR equivalent of "edit" does not exist —
+// re-pairing there means a new QR scan, whereas a Cloud account is repaired
+// by replacing its stored credentials.
+$account = null;
+$accountId = (int)($_GET['account'] ?? 0);
+if ($accountId > 0) {
+    $stmt = $conn->prepare("SELECT * FROM wa_accounts WHERE id = ? AND user_id = ? AND provider = 'cloud'");
+    $stmt->bind_param('ii', $accountId, $userId);
+    $stmt->execute();
+    $account = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if (!$account) {
+        flash('error', 'That Cloud API account could not be found.');
+        redirect(APP_URL . '/whatsapp/accounts.php');
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!verifyCsrf()) {
+        $error = 'Invalid request.';
+    } elseif (($_POST['action'] ?? '') === 'rotate_verify' && $account) {
+        // A new verify token for the Meta handshake — the old one may have
+        // been pasted somewhere it should not have been.
+        $stmt = $conn->prepare("UPDATE wa_accounts SET cloud_verify_token = ? WHERE id = ? AND user_id = ?");
+        $newToken = cloudNewKey();
+        $stmt->bind_param('sii', $newToken, $account['id'], $userId);
+        $stmt->execute();
+        $stmt->close();
+        logAudit($conn, 'wa_account.cloud_rotate_verify', 'wa_account', $account['session_id']);
+        redirect(APP_URL . '/whatsapp/connect-cloud.php?account=' . (int)$account['id'] . '&saved=1');
+    } elseif (planHasFeature($plan, 'cloud_api')) {
+        $label = trim($_POST['label'] ?? '');
+        $pnid = preg_replace('/\D+/', '', (string)($_POST['cloud_phone_number_id'] ?? ''));
+        $waba = preg_replace('/\D+/', '', (string)($_POST['cloud_waba_id'] ?? ''));
+        // Optional column: an empty string would store '' rather than NULL.
+        $wabaDb = $waba !== '' ? $waba : null;
+        $token = trim((string)($_POST['access_token'] ?? ''));
+        $secret = trim((string)($_POST['app_secret'] ?? ''));
+
+        if (strlen($label) > 100) $label = substr($label, 0, 100);
+
+        if (strlen($pnid) < 5 || strlen($pnid) > 32) {
+            $error = 'The phone number id is the numeric id from your Meta app (5–32 digits).';
+        } elseif (!$account && $token === '') {
+            $error = 'The access token is required.';
+        } elseif (!$account && $secret === '') {
+            $error = 'The app secret is required.';
+        } elseif ($secret !== '' && !preg_match('/^[\x21-\x7e]{16,128}$/', $secret)) {
+            $error = 'The app secret should be the 32-character hex string from your Meta app.';
+        }
+
+        if ($error === '') {
+            $tokenEnc = $token !== '' ? encryptSecret($token, WA_CLOUD_CONTEXT) : null;
+            $secretEnc = $secret !== '' ? encryptSecret($secret, WA_CLOUD_CONTEXT) : null;
+            if (($token !== '' && $tokenEnc === null) || ($secret !== '' && $secretEnc === null)) {
+                $error = cryptoSecretMissingMessage();
+            }
+        }
+
+        // Verify against Meta *before* writing anything: storing credentials
+        // Meta rejects would leave a "connected" account that can neither
+        // send nor receive.
+        if ($error === '') {
+            $checkToken = $token !== '' ? $token : null;
+            if ($checkToken === null) {
+                $checkToken = decryptSecret($account['cloud_access_token_encrypted'] ?? null, WA_CLOUD_CONTEXT);
+            }
+            if ($checkToken === null) {
+                $error = 'The stored access token can no longer be read — re-enter it.';
+            } else {
+                $checkPnid = $pnid !== '' ? $pnid : (string)$account['cloud_phone_number_id'];
+                $v = cloudVerifyCredentials($checkPnid, $checkToken);
+                if (!$v['ok']) {
+                    $error = 'Meta rejected these credentials: ' . $v['error'];
+                }
+            }
+        }
+
+        if ($error === '') {
+            if ($account) {
+                // Edit: blank token/secret keep the stored ones.
+                try {
+                    if ($tokenEnc !== null && $secretEnc !== null) {
+                        $stmt = $conn->prepare("UPDATE wa_accounts SET label = ?, cloud_phone_number_id = ?, cloud_waba_id = ?,
+                            cloud_access_token_encrypted = ?, cloud_app_secret_encrypted = ?,
+                            status = 'connected', phone_number = ?, push_name = ?, cloud_last_error = NULL
+                            WHERE id = ? AND user_id = ?");
+                        $stmt->bind_param('sssssssii', $label, $pnid, $wabaDb, $tokenEnc, $secretEnc, $v['phone'], $v['name'], $account['id'], $userId);
+                    } elseif ($tokenEnc !== null) {
+                        $stmt = $conn->prepare("UPDATE wa_accounts SET label = ?, cloud_phone_number_id = ?, cloud_waba_id = ?,
+                            cloud_access_token_encrypted = ?,
+                            status = 'connected', phone_number = ?, push_name = ?, cloud_last_error = NULL
+                            WHERE id = ? AND user_id = ?");
+                        $stmt->bind_param('ssssssii', $label, $pnid, $wabaDb, $tokenEnc, $v['phone'], $v['name'], $account['id'], $userId);
+                    } elseif ($secretEnc !== null) {
+                        $stmt = $conn->prepare("UPDATE wa_accounts SET label = ?, cloud_phone_number_id = ?, cloud_waba_id = ?,
+                            cloud_app_secret_encrypted = ?,
+                            status = 'connected', phone_number = ?, push_name = ?, cloud_last_error = NULL
+                            WHERE id = ? AND user_id = ?");
+                        $stmt->bind_param('ssssssii', $label, $pnid, $wabaDb, $secretEnc, $v['phone'], $v['name'], $account['id'], $userId);
+                    } else {
+                        $stmt = $conn->prepare("UPDATE wa_accounts SET label = ?, cloud_phone_number_id = ?, cloud_waba_id = ?,
+                            status = 'connected', phone_number = ?, push_name = ?, cloud_last_error = NULL
+                            WHERE id = ? AND user_id = ?");
+                        $stmt->bind_param('sssssii', $label, $pnid, $wabaDb, $v['phone'], $v['name'], $account['id'], $userId);
+                    }
+                    $stmt->execute();
+                    $stmt->close();
+                    logAudit($conn, 'wa_account.cloud_update', 'wa_account', $account['session_id']);
+                    redirect(APP_URL . '/whatsapp/connect-cloud.php?account=' . (int)$account['id'] . '&saved=1');
+                } catch (mysqli_sql_exception $e) {
+                    // uniq_wa_cloud_pnid: the edit pointed this account at a
+                    // phone number id another row already owns.
+                    $error = 'That phone number id is already connected.';
+                }
+            } else {
+                // Deliberately quota-checked here rather than only at page
+                // render: the form could have been opened while under the
+                // limit and submitted after hitting it. The edit path above
+                // is not checked, for the same reason re-link is not — an
+                // existing account is already counted.
+                // #18: the quota re-check and the insert run inside one named
+                // lock per tenant — two simultaneous submits each saw room
+                // under the limit and both connected. redirect() inside the
+                // closure exits, and withNamedLock()'s finally still releases.
+                $error = withNamedLock($conn, 'wa_link_' . $userId,
+                    function () use ($conn, $userId, $plan, $label, $v, $pnid, $wabaDb, $tokenEnc, $secretEnc) {
+                    [$quotaOk, , $quotaLimit] = checkWaAccountQuota($conn, $userId);
+                    if (!$quotaOk) {
+                        return 'Your ' . htmlspecialchars($plan['name'] ?? 'current') . ' plan allows '
+                               . formatLimit($quotaLimit) . ' WhatsApp account(s). Upgrade to connect more.';
+                    }
+                    $sessionId = cloudNewSessionId();
+                    $webhookKey = cloudNewKey();
+                    $verifyToken = cloudNewKey();
+                    try {
+                        $stmt = $conn->prepare("INSERT INTO wa_accounts
+                            (user_id, session_id, label, status, phone_number, push_name, connected_at,
+                             provider, cloud_phone_number_id, cloud_waba_id,
+                             cloud_access_token_encrypted, cloud_app_secret_encrypted,
+                             cloud_webhook_key, cloud_verify_token)
+                            VALUES (?, ?, ?, 'connected', ?, ?, UTC_TIMESTAMP(), 'cloud', ?, ?, ?, ?, ?, ?)");
+                        $stmt->bind_param('issssssssss', $userId, $sessionId, $label, $v['phone'], $v['name'],
+                            $pnid, $wabaDb, $tokenEnc, $secretEnc, $webhookKey, $verifyToken);
+                        $stmt->execute();
+                        $newId = $conn->insert_id;
+                        $stmt->close();
+                        logAudit($conn, 'wa_account.cloud_connect', 'wa_account', $sessionId, ['label' => $label]);
+                        redirect(APP_URL . '/whatsapp/connect-cloud.php?account=' . (int)$newId . '&saved=1');
+                    } catch (mysqli_sql_exception $e) {
+                        // uniq_wa_cloud_pnid: one phone number id, one account.
+                        return 'That phone number id is already connected.';
+                    }
+                    return '';
+                    });
+            }
+        }
+    }
+}
+
+$pageTitle = $account ? 'Cloud API Connection' : 'Connect Cloud API';
+require_once dirname(__DIR__) . '/includes/header.php';
+?>
+
+<?php if ($error): ?>
+    <div class="alert alert-danger alert-dismissible fade show">
+        <?= sanitize($error) ?><button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+<?php endif; ?>
+<?php if (isset($_GET['saved'])): ?>
+    <div class="alert alert-success alert-dismissible fade show">
+        Saved.<button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+<?php endif; ?>
+
+<?php if (!planHasFeature($plan, 'cloud_api')): ?>
+<div class="row justify-content-center">
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header">Connect an official Cloud API number</div>
+            <div class="card-body">
+                <div class="alert alert-warning mb-0">
+                    Your plan does not include the Meta Cloud API connection.
+                    <a href="<?= APP_URL ?>/billing.php" class="alert-link">Upgrade your plan</a> to use it.
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+<?php else: ?>
+<div class="row">
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header"><?= $account ? 'Edit Cloud API connection' : 'Connect an official Cloud API number' ?></div>
+            <div class="card-body">
+                <?php // autocomplete="off" on the form plus "new-password" on the
+                      // secret fields: browsers otherwise fill the login email into
+                      // the first text field and a saved password into the token. ?>
+                <form method="POST" autocomplete="off">
+                    <?= csrfField() ?>
+                    <div class="mb-3">
+                        <label class="form-label">Account Label</label>
+                        <input type="text" name="label" class="form-control" maxlength="100" autocomplete="off"
+                               placeholder="e.g. Main shop line"
+                               value="<?= sanitize($_POST['label'] ?? ($account['label'] ?? '')) ?>">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Phone number id</label>
+                        <input type="text" name="cloud_phone_number_id" class="form-control" required
+                               inputmode="numeric" autocomplete="off" placeholder="e.g. 123456789012345"
+                               value="<?= sanitize($_POST['cloud_phone_number_id'] ?? ($account['cloud_phone_number_id'] ?? '')) ?>">
+                        <div class="form-text">The numeric id shown under the “From” number on Meta’s API Setup page — not the phone number itself. See step 3 on the right.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">WhatsApp Business Account id <span class="text-muted">(optional)</span></label>
+                        <input type="text" name="cloud_waba_id" class="form-control" inputmode="numeric" autocomplete="off"
+                               value="<?= sanitize($_POST['cloud_waba_id'] ?? ($account['cloud_waba_id'] ?? '')) ?>">
+                        <div class="form-text">Shown at the top of the API Setup page. See step 2.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Access token <?= $account ? '<span class="text-muted">(leave blank to keep the stored one)</span>' : '' ?></label>
+                        <input type="password" name="access_token" class="form-control" autocomplete="new-password" <?= $account ? '' : 'required' ?>>
+                        <div class="form-text">A permanent System User token (step 5), not the temporary one from API Setup. Stored encrypted and never shown again.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">App secret <?= $account ? '<span class="text-muted">(leave blank to keep the stored one)</span>' : '' ?></label>
+                        <input type="password" name="app_secret" class="form-control" autocomplete="new-password" <?= $account ? '' : 'required' ?>>
+                        <div class="form-text">From App settings → Basic (step 4). Verifies that webhook deliveries really come from Meta. Also stored encrypted and never shown again.</div>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">
+                        <i class="bi bi-cloud me-2"></i><?= $account ? 'Save and verify' : 'Verify and connect' ?>
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-6">
+    <?php if ($account): ?>
+        <div class="card">
+            <div class="card-header">Step 6 · Webhook settings for your Meta app</div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <label class="form-label">Callback URL</label>
+                    <div class="input-group">
+                        <input type="text" class="form-control" readonly
+                               value="<?= sanitize(APP_URL . '/webhooks/meta.php?key=' . $account['cloud_webhook_key']) ?>"
+                               id="cbUrl">
+                        <button type="button" class="btn btn-outline-secondary" onclick="navigator.clipboard.writeText(document.getElementById('cbUrl').value)">Copy</button>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Verify token</label>
+                    <div class="input-group">
+                        <input type="text" class="form-control" readonly
+                               value="<?= sanitize($account['cloud_verify_token']) ?>" id="vToken">
+                        <button type="button" class="btn btn-outline-secondary" onclick="navigator.clipboard.writeText(document.getElementById('vToken').value)">Copy</button>
+                    </div>
+                </div>
+                <form method="POST" class="mb-3">
+                    <?= csrfField() ?>
+                    <input type="hidden" name="action" value="rotate_verify">
+                    <button type="submit" class="btn btn-sm btn-outline-warning">Regenerate verify token</button>
+                </form>
+                <h6 class="fw-600 mt-4 mb-3">In the Meta dashboard</h6>
+                <ol class="setup-steps">
+                    <li>
+                        <div class="setup-step-title">Open the webhook settings</div>
+                        <div class="setup-step-path"><a href="https://developers.facebook.com/apps" target="_blank" rel="noopener">Meta for Developers</a> <span>›</span> your app <span>›</span> Use cases <span>›</span> Customize <span>›</span> Configuration</div>
+                        <div class="setup-step-note">Older apps: WhatsApp › Configuration.</div>
+                    </li>
+                    <li>
+                        <div class="setup-step-title">Paste the two values above</div>
+                        <div class="setup-step-note">Under <strong>Webhook</strong> click <strong>Edit</strong>, paste the Callback URL and Verify token, then <strong>Verify and save</strong>.</div>
+                    </li>
+                    <li>
+                        <div class="setup-step-title">Subscribe to messages</div>
+                        <div class="setup-step-note">Click <strong>Manage</strong> next to Webhook fields and turn on <span class="setup-chip">messages</span>.</div>
+                    </li>
+                    <li>
+                        <div class="setup-step-title">Send a test</div>
+                        <div class="setup-step-note">Message this business number from an allowed phone. It shows up under <a href="<?= APP_URL ?>/whatsapp/chats.php">Chats</a> and the bot replies.</div>
+                    </li>
+                </ol>
+                <div class="setup-tips">
+                    <div class="setup-tips-title"><i class="bi bi-lightbulb"></i> Good to know</div>
+                    <ul>
+                        <li>In <strong>development mode</strong> only the numbers on the Meta app’s “To” list (max 5) can be messaged.</li>
+                        <li>Free-form replies are allowed for <strong>24 hours</strong> after the customer’s last message; anything later needs an approved template.</li>
+                        <li>Reset the app secret or token in Meta? Paste the new value in the form on the left — stored values are never shown again.</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    <?php else: ?>
+        <div class="card">
+            <div class="card-header"><i class="bi bi-signpost-2"></i> Where to find these in Meta</div>
+            <div class="card-body">
+                <ol class="setup-steps">
+                    <li>
+                        <div class="setup-step-title">Create the Meta app</div>
+                        <div class="setup-step-path"><a href="https://developers.facebook.com/apps" target="_blank" rel="noopener">developers.facebook.com/apps</a> <span>›</span> Create App</div>
+                        <div class="setup-step-note">Pick the use case <strong>Connect with customers through WhatsApp</strong> and a Business portfolio, then <strong>Create app</strong>.</div>
+                    </li>
+                    <li>
+                        <div class="setup-step-title">WhatsApp Business Account id <span class="setup-optional">optional</span></div>
+                        <div class="setup-step-path">Quickstart <span>›</span> Start using the API <span>›</span> API Setup</div>
+                        <div class="setup-step-note">Connect or create a WhatsApp Business account. Its id is shown at the top of the page.</div>
+                    </li>
+                    <li>
+                        <div class="setup-step-title">Phone number id</div>
+                        <div class="setup-step-path">API Setup <span>›</span> From</div>
+                        <div class="setup-step-note">A free test number is pre-created. Copy the <span class="setup-chip">Phone number ID</span> shown under it — the 15-digit id, not the phone number. For your own number use <strong>Add phone number</strong> and verify it by SMS or call first.</div>
+                        <div class="setup-step-note">Add your own WhatsApp number under <strong>To</strong>, send the test message and reply to it from your phone.</div>
+                    </li>
+                    <li>
+                        <div class="setup-step-title">App secret</div>
+                        <div class="setup-step-path">App settings <span>›</span> Basic <span>›</span> App secret <span>›</span> Show</div>
+                        <div class="setup-step-note">A 32-character string.</div>
+                    </li>
+                    <li>
+                        <div class="setup-step-title">Permanent access token</div>
+                        <div class="setup-step-path"><a href="https://business.facebook.com/latest/settings" target="_blank" rel="noopener">Business settings</a> <span>›</span> Users <span>›</span> System users <span>›</span> Add</div>
+                        <div class="setup-step-note">Create an <strong>Admin</strong> system user. <strong>Assign assets</strong>: your app (Manage app) and your WhatsApp account (Manage WhatsApp Business accounts). Then <strong>Generate token</strong> with expiry <strong>Never</strong> and these permissions:</div>
+                        <div class="setup-step-note"><span class="setup-chip">whatsapp_business_messaging</span> <span class="setup-chip">whatsapp_business_management</span> <span class="setup-chip">business_management</span></div>
+                        <div class="setup-step-warn"><i class="bi bi-exclamation-triangle"></i> Don’t use the token on the API Setup page — it expires in 24 hours. Copy the system user token straight away; Meta never shows it again.</div>
+                    </li>
+                    <li>
+                        <div class="setup-step-title">Connect, then set up the webhook</div>
+                        <div class="setup-step-note">Fill in the form and click <strong>Verify and connect</strong>. The Callback URL and Verify token for Meta are generated on save and shown on the next page with the remaining steps.</div>
+                    </li>
+                </ol>
+                <p class="x-small text-muted mb-0 mt-3"><i class="bi bi-shield-lock me-1"></i>Credentials are checked against Meta before anything is stored, and are kept encrypted.</p>
+            </div>
+        </div>
+    <?php endif; ?>
+    </div>
+</div>
+<?php endif; ?>
+
+<?php require_once dirname(__DIR__) . '/includes/footer.php'; ?>

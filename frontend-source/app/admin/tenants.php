@@ -1,0 +1,664 @@
+<?php
+// Tenant management. Moved out of admin/index.php so the console landing can be
+// an overview rather than a single table; see includes/admin-init.php for the
+// guard.
+require_once dirname(__DIR__) . '/includes/admin-init.php';
+
+$self = APP_URL . '/admin/tenants.php';
+
+// Carried across a plain (non-AJAX) create so the temporary password can be
+// shown once on the page that follows the redirect. Deliberately the session
+// and not a query string: a password in a URL lands in the access log, the
+// browser history and any Referer sent to a CDN.
+$justCreated = $_SESSION['admin_tenant_created'] ?? null;
+unset($_SESSION['admin_tenant_created']);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    formRequireCsrf($self);
+
+    $action = $_POST['action'] ?? '';
+    $targetId = (int)($_POST['user_id'] ?? 0);
+
+    // An admin locking themselves out, or demoting the last admin, leaves the
+    // instance unadministrable. Block both.
+    if ($targetId === $adminId && in_array($action, ['suspend', 'toggle_admin'], true)) {
+        formRespond(false, 'You cannot change your own access.', $self);
+    }
+
+    // The self-check above already makes zero admins unreachable, because the
+    // only admin on an instance cannot act on themselves. This states the
+    // invariant rather than leaving it emergent (#48): it is the check that
+    // still holds if the self-check is ever relaxed, and it catches the case
+    // the self-check cannot see — suspending or demoting the *other* admin
+    // when your own account is the one that is about to be suspended.
+    if (in_array($action, ['suspend', 'toggle_admin'], true) && wouldOrphanInstance($conn, $targetId)) {
+        formRespond(false, 'That is the last account that can administer this instance. '
+            . 'Give another customer administrator access first.', $self);
+    }
+
+    // Creating a tenant (#48, #49). The rules live in createTenant() so this
+    // page is only responsible for the form and the reply.
+    if ($action === 'create') {
+        $result = createTenant($conn, [
+            'name'         => $_POST['name'] ?? '',
+            'email'        => $_POST['email'] ?? '',
+            'company_name' => $_POST['company_name'] ?? '',
+            'plan_id'      => $_POST['plan_id'] ?? 0,
+            'status'       => $_POST['status'] ?? 'active',
+            'onboarding'   => $_POST['onboarding'] ?? 'invite',
+        ], $adminId);
+
+        if (!$result['ok']) {
+            formRespond(false, $result['message'], $self, $result['errors']);
+        }
+
+        // A temporary password or an undelivered invite link is shown exactly
+        // once, and only to the admin who just created the account. Neither is
+        // recoverable afterwards — the password is only stored as a hash, and
+        // re-issuing the link means creating a new one.
+        if ($result['temp_password'] !== null || $result['invite_link'] !== null) {
+            $_SESSION['admin_tenant_created'] = [
+                'email'         => trim((string)($_POST['email'] ?? '')),
+                'temp_password' => $result['temp_password'],
+                'invite_link'   => $result['invite_link'],
+            ];
+        }
+
+        // The JSON path is given a redirect rather than a reload: the one-time
+        // secret is rendered by the *next* page load, and a toast that vanishes
+        // after four seconds is not where a password goes.
+        //
+        // forms.js follows res.redirect without showing the message, so the
+        // flash is set by hand for that path only — formRespond() sets its own
+        // on the plain path, and doing both would say it twice.
+        if (isXhrRequest()) flash('success', $result['message']);
+        formRespond(true, $result['message'], $self, [], ['redirect' => $self]);
+    }
+
+    if ($action === 'suspend' || $action === 'activate') {
+        $status = $action === 'suspend' ? 'suspended' : 'active';
+        $stmt = $conn->prepare("UPDATE users SET status = ? WHERE id = ?");
+        $stmt->bind_param('si', $status, $targetId);
+        $stmt->execute();
+        $stmt->close();
+        // Suspension must end every open session at once, not wait for the
+        // tenant's next request to trip the status check — the bump also kills
+        // any "remembered device" cookies (#13, #3).
+        if ($action === 'suspend') {
+            bumpSessionVersion($conn, $targetId);
+        }
+        // Suspending also parks the customer's Baileys sockets (#3.4): the
+        // status check already stops the bot, but an idle connected session
+        // still costs the backend tens of MB each. Reactivating brings them
+        // back — normally without a QR scan.
+        $wa = waSetTenantPaused($conn, $targetId, $action === 'suspend');
+        logAudit($conn, 'admin.user.' . $action, 'user', $targetId);
+
+        $msg = $action === 'suspend' ? 'Customer suspended.' : 'Customer reactivated.';
+        $extra = [];
+        if ($wa['done'] > 0) {
+            $msg .= ' ' . $wa['done'] . ' WhatsApp ' . ($wa['done'] === 1 ? 'connection' : 'connections')
+                . ($action === 'suspend' ? ' paused.' : ' resumed.');
+        }
+        if ($wa['failed'] > 0) {
+            $msg .= ' ' . $wa['failed'] . ' could not be reached — check System.';
+            // A success that half-failed is still a success — but not a green
+            // one: the tenant's sockets the call missed are still in whatever
+            // state they were in.
+            $extra['variant'] = 'warning';
+        }
+        formRespond(true, $msg, $self, [], $extra);
+    }
+
+    // Per-account pause/resume, driven from the customer's detail page (#3.4).
+    // Reaches the session through the account row, never through a client-
+    // supplied session id, so the backend's tenant check stays redundant.
+    if ($action === 'pause_wa' || $action === 'resume_wa') {
+        $accountId = (int)($_POST['account_id'] ?? 0);
+        $stmt = $conn->prepare(
+            "SELECT a.user_id, a.session_id, a.provider, u.status AS owner_status
+             FROM wa_accounts a JOIN users u ON u.id = a.user_id WHERE a.id = ?"
+        );
+        $stmt->bind_param('i', $accountId);
+        $stmt->execute();
+        $acc = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        // Cloud accounts have no socket to park — there is nothing to pause.
+        if (!$acc || ($acc['provider'] ?? 'baileys') === 'cloud') {
+            formRespond(false, 'That account no longer exists.', $self);
+        }
+        $ownerId = (int)$acc['user_id'];
+        // Resuming a suspended customer's session would undo the pause the
+        // suspension just applied — the customer has to be live first.
+        if ($action === 'resume_wa' && $acc['owner_status'] === 'suspended') {
+            formRespond(false, 'Reactivate the customer first.', APP_URL . '/admin/tenant.php?id=' . $ownerId);
+        }
+
+        $resp = callBackendApi(
+            'POST',
+            '/api/v1/wa/sessions/' . urlencode($acc['session_id']) . '/' . ($action === 'pause_wa' ? 'pause' : 'resume'),
+            null,
+            't' . $ownerId,
+            10
+        );
+        if (($resp['httpCode'] ?? 0) !== 200) {
+            formRespond(false, 'The WhatsApp service could not be reached — check System.', APP_URL . '/admin/tenant.php?id=' . $ownerId);
+        }
+
+        // The backend's snapshot wins: resume is a no-op there on a live
+        // session, and 'reconnecting' would mislabel a 'connected' row.
+        $newStatus = is_string($resp['status'] ?? null) && $resp['status'] !== ''
+            ? $resp['status'] : ($action === 'pause_wa' ? 'paused' : 'reconnecting');
+        $stmt = $conn->prepare("UPDATE wa_accounts SET status = ? WHERE id = ?");
+        $stmt->bind_param('si', $newStatus, $accountId);
+        $stmt->execute();
+        $stmt->close();
+
+        logAudit($conn, 'admin.wa.' . ($action === 'pause_wa' ? 'pause' : 'resume'), 'wa_account', $acc['session_id'], ['user_id' => $ownerId]);
+        formRespond(true, $action === 'pause_wa' ? 'WhatsApp connection paused.' : 'WhatsApp connection resumed.', APP_URL . '/admin/tenant.php?id=' . $ownerId);
+    }
+
+    // An admin sets a customer's password directly (#48): there is no emailed
+    // reset on this path — the password is shown once in the modal and passed
+    // on by hand. must_change_password forces them to choose their own at the
+    // next sign-in.
+    if ($action === 'reset_password') {
+        if ($targetId === $adminId) {
+            formRespond(false, 'Change your own password from your profile.', $self);
+        }
+
+        $stmt = $conn->prepare("SELECT id, email, name FROM users WHERE id = ?");
+        $stmt->bind_param('i', $targetId);
+        $stmt->execute();
+        $target = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+        if (!$target) {
+            formRespond(false, 'Customer not found.', $self);
+        }
+
+        $pw = (string)($_POST['new_password'] ?? '');
+        $problem = passwordProblem($pw, ['email' => $target['email'], 'name' => $target['name']]);
+        if ($problem !== null) {
+            formRespond(false, $problem, $self, ['new_password' => $problem]);
+        }
+
+        $stmt = $conn->prepare("UPDATE users SET password = ?, must_change_password = 1 WHERE id = ?");
+        $hash = password_hash($pw, PASSWORD_DEFAULT);
+        $stmt->bind_param('si', $hash, $targetId);
+        $stmt->execute();
+        $stmt->close();
+
+        // Every remembered session is stale the moment the password changes —
+        // same reasoning as suspension (#13).
+        bumpSessionVersion($conn, $targetId);
+        // Never the password in the log: the audit trail is readable by every
+        // admin, and the value is deliberately not recoverable once shown.
+        logAudit($conn, 'admin.user.reset_password', 'user', $targetId);
+        formRespond(true, 'Password changed. Give it to the customer — it is not emailed and they must choose a new one at their next sign-in.', $self, [], ['reload' => false]);
+    }
+
+    if ($action === 'change_plan') {
+        $planId = (int)($_POST['plan_id'] ?? 0);
+        // assignPlan() rather than a bare UPDATE on users.plan_id. The bare
+        // update changed the tenant's limits and features immediately but left
+        // the subscriptions row pointing at the old plan, so Billing kept showing
+        // the previous plan's renewal date and the lapsing report kept naming the
+        // old plan. The tenant saw one plan's limits with another plan's billing.
+        if ($planId > 0 && getPlanById($conn, $planId)) {
+            assignPlan($conn, $targetId, $planId);
+            logAudit($conn, 'admin.user.change_plan', 'user', $targetId, ['plan_id' => $planId]);
+            formRespond(true, 'Plan updated.', $self);
+        }
+        // The key is the <select>'s own name, so the AJAX path marks the very
+        // control that was wrong — a plan can disappear between the page being
+        // rendered and the Set button being pressed.
+        formRespond(false, 'That plan does not exist.', $self, ['plan_id' => 'Pick a plan that still exists.']);
+    }
+
+    if ($action === 'toggle_admin') {
+        $stmt = $conn->prepare("UPDATE users SET is_admin = 1 - is_admin WHERE id = ?");
+        $stmt->bind_param('i', $targetId);
+        $stmt->execute();
+        $stmt->close();
+        logAudit($conn, 'admin.user.toggle_admin', 'user', $targetId);
+        formRespond(true, 'Administrator access updated.', $self);
+    }
+
+    // Every branch above exits, so this is only reached by a POST naming an
+    // action that does not exist. It has to answer through formRespond() rather
+    // than redirect(): a bare 302 to an HTML page would come back to fetch() as
+    // something it cannot parse, and the submit would look like a network error.
+    formRespond(false, 'Unknown action.', $self);
+}
+
+$plans = getActivePlans($conn);
+
+// --- Search / filter ---
+$q          = trim($_GET['q'] ?? '');
+$fStatus    = $_GET['status'] ?? '';
+$fPlan      = (int)($_GET['plan'] ?? 0);
+$fSince     = trim($_GET['since'] ?? '');
+$sort       = $_GET['sort'] ?? 'created_desc';
+
+// LEFT JOIN on user_profiles, not INNER: the profile is optional, and a tenant
+// who never filled one in must still appear in this list.
+$sql = "SELECT u.id, u.name, u.email, u.is_active, u.is_admin, u.status, u.created_at, u.last_login_at,
+               p.name AS plan_name, p.id AS plan_id,
+               up.company_name,
+               (SELECT COUNT(*) FROM wa_accounts wa WHERE wa.user_id = u.id) AS wa_count
+        FROM users u
+        LEFT JOIN plans p ON u.plan_id = p.id
+        LEFT JOIN user_profiles up ON up.user_id = u.id";
+
+$where = [];
+$types = '';
+$args = [];
+
+if ($q !== '') {
+    $where[] = '(u.name LIKE ? OR u.email LIKE ? OR up.company_name LIKE ?)';
+    $like = '%' . $q . '%';
+    $types .= 'sss';
+    array_push($args, $like, $like, $like);
+}
+// `unactivated` is not a `status` value — it is is_active = 0 — so it cannot be
+// folded into the same comparison.
+if ($fStatus === 'active' || $fStatus === 'suspended') {
+    $where[] = 'u.status = ? AND u.is_active = 1';
+    $types .= 's';
+    $args[] = $fStatus;
+} elseif ($fStatus === 'unactivated') {
+    $where[] = 'u.is_active = 0';
+}
+if ($fPlan > 0) {
+    $where[] = 'u.plan_id = ?';
+    $types .= 'i';
+    $args[] = $fPlan;
+}
+if ($fSince !== '' && DateTime::createFromFormat('Y-m-d', $fSince)) {
+    $where[] = 'u.created_at >= ?';
+    $types .= 's';
+    $args[] = $fSince . ' 00:00:00';
+}
+if ($where) $sql .= ' WHERE ' . implode(' AND ', $where);
+
+// Whitelisted, never interpolated from the raw parameter.
+$sorts = [
+    'created_desc' => 'u.created_at DESC',
+    'created_asc'  => 'u.created_at ASC',
+    'name'         => 'u.name ASC',
+    'login_desc'   => 'u.last_login_at IS NULL, u.last_login_at DESC',
+    'wa_desc'      => 'wa_count DESC',
+];
+$sql .= ' ORDER BY ' . ($sorts[$sort] ?? $sorts['created_desc']);
+
+$stmt = $conn->prepare($sql);
+if ($types !== '') $stmt->bind_param($types, ...$args);
+$stmt->execute();
+$users = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
+
+$filtered = $q !== '' || $fStatus !== '' || $fPlan > 0 || $fSince !== '';
+
+// There are deliberately no server-rendered field errors on the create form,
+// unlike admin/plans.php.
+//
+// Every action on this page answers through formRespond(), which redirects the
+// plain path — so a rejected create never comes back to a re-rendered form and
+// per-field markup would be code that cannot run. The AJAX path, which is the
+// one an admin actually uses, gets the same $errors array and forms.js paints
+// it onto the inputs; the plain path gets a flash that names each problem in
+// full, which is why createTenant() builds its message from them.
+
+// Whether a password-setup invitation can actually be delivered. Read once and
+// passed to the partial rather than called from inside it, so the form and the
+// server-side check in createTenant() cannot disagree about it.
+$canEmail = smtpConfigured($conn);
+
+$pageTitle = 'Customers';
+require_once dirname(__DIR__) . '/includes/admin-header.php';
+?>
+
+<?php // The one-time secret, if the create that just happened produced one.
+      //
+      // Rendered at the top of the page and nowhere else. It is gone from the
+      // session by the time this runs, so a refresh does not show it again —
+      // which is the honest behaviour, because the password only exists as a
+      // hash and the link is single-use. ?>
+<?php if ($justCreated): ?>
+    <div class="card border-warning mb-4">
+        <div class="card-header bg-warning-subtle d-flex align-items-center gap-2">
+            <i class="bi bi-key"></i>
+            <span>Shown once — copy it now</span>
+        </div>
+        <div class="card-body">
+            <p class="small mb-3">
+                For <strong><?= sanitize($justCreated['email']) ?></strong>. This will not be
+                shown again: reloading this page loses it, and it cannot be recovered afterwards.
+            </p>
+            <?php if (!empty($justCreated['temp_password'])): ?>
+                <label class="form-label small text-muted">Temporary password</label>
+                <input type="text" class="form-control font-monospace mb-2" readonly
+                       onclick="this.select()" value="<?= sanitize($justCreated['temp_password']) ?>">
+                <p class="x-small text-muted mb-0">
+                    They must replace it the first time they sign in — nothing else on the
+                    account is reachable until they do.
+                </p>
+            <?php endif; ?>
+            <?php if (!empty($justCreated['invite_link'])): ?>
+                <label class="form-label small text-muted">Password-setup link</label>
+                <input type="text" class="form-control font-monospace mb-2" readonly
+                       onclick="this.select()" value="<?= sanitize($justCreated['invite_link']) ?>">
+                <p class="x-small text-muted mb-0">
+                    The email could not be sent, so send this to them yourself. It can be used
+                    once and expires in 7 days.
+                </p>
+            <?php endif; ?>
+        </div>
+    </div>
+<?php endif; ?>
+
+<div class="page-toolbar">
+    <div>
+        <p class="page-toolbar-title">Customers</p>
+        <p class="page-toolbar-subtitle">
+            <?= number_format(count($users)) ?> <?= count($users) === 1 ? 'customer' : 'customers' ?> <?= $filtered ? 'matching' : 'total' ?>
+        </p>
+    </div>
+    <div class="page-toolbar-actions">
+        <?php // A real link to the form's own anchor, so it works with
+              // JavaScript off; data-modal-target upgrades it to the modal
+              // forms.js promoted the card into. ?>
+        <a href="#tenantShell" class="btn btn-sm btn-primary"
+           data-modal-target="#tenantModal" data-modal-reset="on"
+           data-modal-title="New customer">
+            <i class="bi bi-plus-lg me-1"></i>New customer
+        </a>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <?php // Collapsed only under 768px: d-md-block keeps it open from
+              // tablets up without any JavaScript. The form itself is plain GET. ?>
+        <button type="button" class="btn btn-sm btn-outline-secondary d-md-none mb-2"
+                data-bs-toggle="collapse" data-bs-target="#tenantFilters"
+                aria-controls="tenantFilters" aria-expanded="false">
+            <i class="bi bi-funnel me-1"></i>Filters <i class="bi bi-chevron-down ms-1"></i>
+        </button>
+        <div class="collapse d-md-block" id="tenantFilters">
+        <form method="GET" class="row g-2 align-items-end">
+            <div class="col-md-4">
+                <label class="form-label x-small text-muted mb-1">Search</label>
+                <input type="search" name="q" class="form-control form-control-sm"
+                       placeholder="Name, email or company" value="<?= sanitize($q) ?>">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label x-small text-muted mb-1">Status</label>
+                <select name="status" class="form-select form-select-sm" onchange="this.form.requestSubmit()">
+                    <option value="">Any</option>
+                    <?php foreach (['active' => 'Active', 'suspended' => 'Suspended', 'unactivated' => 'Unactivated'] as $v => $l): ?>
+                        <option value="<?= $v ?>" <?= $fStatus === $v ? 'selected' : '' ?>><?= $l ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label x-small text-muted mb-1">Plan</label>
+                <select name="plan" class="form-select form-select-sm" onchange="this.form.requestSubmit()">
+                    <option value="0">Any</option>
+                    <?php foreach ($plans as $p): ?>
+                        <option value="<?= (int)$p['id'] ?>" <?= $fPlan === (int)$p['id'] ? 'selected' : '' ?>><?= sanitize($p['name']) ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label x-small text-muted mb-1">Created after</label>
+                <input type="date" name="since" class="form-control form-control-sm" value="<?= sanitize($fSince) ?>">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label x-small text-muted mb-1">Sort</label>
+                <select name="sort" class="form-select form-select-sm" onchange="this.form.requestSubmit()">
+                    <?php foreach ([
+                        'created_desc' => 'Newest first', 'created_asc' => 'Oldest first',
+                        'name' => 'Name', 'login_desc' => 'Most recent login', 'wa_desc' => 'Most accounts',
+                    ] as $v => $l): ?>
+                        <option value="<?= $v ?>" <?= $sort === $v ? 'selected' : '' ?>><?= $l ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="col-12 d-flex gap-2 mt-2">
+                <button class="btn btn-sm btn-primary">Apply</button>
+                <?php if ($filtered || $sort !== 'created_desc'): ?>
+                    <a href="<?= APP_URL ?>/admin/tenants.php" class="btn btn-sm btn-link">Reset</a>
+                <?php endif; ?>
+            </div>
+        </form>
+        </div>
+    </div>
+</div>
+
+<div class="card table-card">
+    <div class="card-header">
+        <span>Customers</span>
+    </div>
+    <div class="table-responsive">
+        <table class="table align-middle table-stack">
+            <thead>
+                <tr>
+                    <th>Customer</th>
+                    <th>Plan</th>
+                    <th>WhatsApp</th>
+                    <th>Status</th>
+                    <th>Last login</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+            <?php if (!$users): ?>
+                <tr><td colspan="6" class="text-muted small">No customers match those filters.</td></tr>
+            <?php endif; ?>
+            <?php foreach ($users as $u): ?>
+                <tr>
+                    <td data-label="Customer" class="cell-block">
+                        <div class="fw-500">
+                            <?php // href is the full detail page, which is what a click does
+                                  // with JavaScript off. With it, the same URL is fetched as a
+                                  // fragment into the modal below — one server-rendered
+                                  // source, two ways of showing it (#49). ?>
+                            <a href="<?= APP_URL ?>/admin/tenant.php?id=<?= (int)$u['id'] ?>"
+                               class="text-decoration-none"
+                               data-modal-target="#tenantViewModal"
+                               data-modal-url="<?= APP_URL ?>/admin/tenant.php?id=<?= (int)$u['id'] ?>"
+                               data-modal-title="<?= sanitize($u['company_name'] ?: $u['name']) ?>">
+                                <?= sanitize($u['company_name'] ?: $u['name']) ?>
+                            </a>
+                            <?php if ($u['is_admin']): ?><span class="badge bg-dark ms-1">Admin</span><?php endif; ?>
+                        </div>
+                        <div class="text-muted small"><?= sanitize($u['email']) ?></div>
+                        <div class="text-muted x-small">Customer ID: t<?= (int)$u['id'] ?></div>
+                    </td>
+                    <td data-label="Plan" class="cell-block">
+                        <form method="POST" class="d-flex gap-1" data-ajax>
+                            <?= csrfField() ?>
+                            <input type="hidden" name="action" value="change_plan">
+                            <input type="hidden" name="user_id" value="<?= (int)$u['id'] ?>">
+                            <select name="plan_id" class="form-select form-select-sm admin-plan-select">
+                                <?php foreach ($plans as $p): ?>
+                                    <option value="<?= (int)$p['id'] ?>" <?= $p['id'] == $u['plan_id'] ? 'selected' : '' ?>>
+                                        <?= sanitize($p['name']) ?> — <?= sanitize(formatPrice($p)) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                            <button class="btn btn-sm btn-outline-primary">Change plan</button>
+                        </form>
+                    </td>
+                    <td data-label="WhatsApp"><?= (int)$u['wa_count'] ?></td>
+                    <td data-label="Status">
+                        <?php if (!$u['is_active']): ?>
+                            <span class="badge bg-secondary">Not activated</span>
+                        <?php elseif ($u['status'] === 'suspended'): ?>
+                            <span class="badge bg-danger">Suspended</span>
+                        <?php else: ?>
+                            <span class="badge bg-success">Active</span>
+                        <?php endif; ?>
+                    </td>
+                    <td class="text-muted small" data-label="Last login">
+                        <?= $u['last_login_at'] ? sanitize(timeAgo($u['last_login_at'])) : '—' ?>
+                    </td>
+                    <td>
+                        <?php if ((int)$u['id'] !== $adminId): ?>
+                        <div class="d-flex gap-1">
+                            <form method="POST" data-ajax>
+                                <?= csrfField() ?>
+                                <input type="hidden" name="user_id" value="<?= (int)$u['id'] ?>">
+                                <input type="hidden" name="action" value="<?= $u['status'] === 'suspended' ? 'activate' : 'suspend' ?>">
+                                <?php // Suspending locks the tenant out on their next request, so it
+                                      // is confirmed. Reactivating is additive and needs no prompt.
+                                      //
+                                      // The message now goes in a data attribute rather than into an
+                                      // onsubmit="confirm(...)", so it is plain text in HTML and
+                                      // sanitize() is exactly the right escaping. The old code had to
+                                      // json_encode() first because the value was JavaScript source,
+                                      // where sanitize()'s &#039; comes back as a quote and breaks
+                                      // the call. Removing the inline script removes that trap. ?>
+                                <button class="btn btn-sm btn-outline-<?= $u['status'] === 'suspended' ? 'success' : 'danger' ?>"
+                                    <?php if ($u['status'] !== 'suspended'): ?>
+                                        data-confirm="Suspend <?= sanitize($u['email']) ?>? They will be signed out and unable to log in until reactivated."
+                                    <?php endif; ?>>
+                                    <?= $u['status'] === 'suspended' ? 'Reactivate' : 'Suspend' ?>
+                                </button>
+                            </form>
+                            <form method="POST" data-ajax>
+                                <?= csrfField() ?>
+                                <input type="hidden" name="user_id" value="<?= (int)$u['id'] ?>">
+                                <input type="hidden" name="action" value="toggle_admin">
+                                <?php // Both directions are confirmed here, unlike the Suspend button
+                                      // above: removing admin rights can leave a colleague locked out
+                                      // of the console, and granting them hands one tenant account
+                                      // full sight of every other tenant on the instance. Neither is
+                                      // the harmless additive case that a dialog would devalue. ?>
+                                <button class="btn btn-sm btn-outline-dark"
+                                    data-confirm="<?= $u['is_admin']
+                                        ? 'Remove admin rights from ' . sanitize($u['email']) . '? They keep their customer account but lose access to the admin console.'
+                                        : 'Give ' . sanitize($u['email']) . ' admin rights? They will be able to view and manage every customer in this app.' ?>"><?= $u['is_admin'] ? 'Remove admin' : 'Make admin' ?></button>
+                            </form>
+                            <?php // Same data-modal-target upgrade as "New customer": a plain
+                                  // anchor to the shell card below with JS off, a modal with it.
+                                  // Deliberately no data-modal-reset: forms.js's reset would
+                                  // blank the hidden user_id back to its default *after*
+                                  // admin-password.js has populated it (this page's script is
+                                  // loaded first, so its click listener runs first). The JS
+                                  // clears and repopulates the fields itself instead.
+                                  // The row's identity travels in data-reset-* attributes —
+                                  // not data-field-*, which forms.js would map by name and
+                                  // could not distinguish the readonly email from user_id. ?>
+                            <a href="#resetPasswordShell" class="btn btn-sm btn-outline-secondary"
+                               data-modal-target="#resetPasswordModal"
+                               data-modal-title="Reset password"
+                               data-reset-user-id="<?= (int)$u['id'] ?>"
+                               data-reset-email="<?= sanitize($u['email']) ?>"
+                               data-reset-name="<?= sanitize($u['name']) ?>">Reset password</a>
+                        </div>
+                        <?php else: ?>
+                            <span class="text-muted small">You</span>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<?php // The read-only tenant detail, loaded on demand (#49).
+      //
+      // Written out here rather than promoted from a card by forms.js, because
+      // there is no card to promote: the body is fetched from admin/tenant.php
+      // and there is nothing to render until a name is clicked. It is a separate
+      // modal from the create one on purpose — sharing would mean a view
+      // replacing the create form's markup with a tenant's details. ?>
+<div class="modal fade" id="tenantViewModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" data-role="modal-title"></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" data-role="modal-body"></div>
+        </div>
+    </div>
+</div>
+
+<?php // Rendered once as a plain card and promoted to a modal by forms.js (#24).
+      //
+      // Unlike the plan editor this form is not fetched: it starts empty every
+      // time, so there is nothing for the server to populate and a round trip to
+      // ask for a blank form would be a request for nothing. data-modal-reset
+      // on the trigger clears it between opens. ?>
+<div class="card mt-4" id="tenantShell" data-modal-shell="tenantModal" data-modal-title="New customer">
+    <div class="card-header">New customer</div>
+    <div class="card-body">
+        <?php require __DIR__ . '/partials/tenant-form.php'; ?>
+    </div>
+</div>
+
+<?php // The admin-set password (#48). No email is involved — the value is
+      // typed or generated here, shown once in the result panel, and the
+      // customer must replace it at their next sign-in (must_change_password).
+      // data-ajax-reload="off" matters: reloading would throw away the panel
+      // that is showing the password. ?>
+<div class="card mt-4" id="resetPasswordShell" data-modal-shell="resetPasswordModal" data-modal-title="Reset password">
+    <div class="card-header">Reset password</div>
+    <div class="card-body">
+        <form id="resetPasswordForm" method="POST" data-ajax data-ajax-reload="off">
+            <?= csrfField() ?>
+            <input type="hidden" name="action" value="reset_password">
+            <input type="hidden" name="user_id" value="">
+            <div data-role="reset-inputs">
+                <div class="mb-3">
+                    <label class="form-label small text-muted" for="resetEmail">Customer</label>
+                    <input type="text" id="resetEmail" class="form-control" readonly
+                           data-role="reset-email" value="">
+                </div>
+                <div class="mb-2">
+                    <label class="form-label small" for="resetNewPassword">New password</label>
+                    <div class="input-group">
+                        <input type="password" id="resetNewPassword" name="new_password"
+                               class="form-control font-monospace" autocomplete="new-password"
+                               maxlength="72" data-role="reset-password">
+                        <button type="button" class="btn btn-outline-secondary" data-role="toggle-visible"
+                                aria-label="Show password"><i class="bi bi-eye"></i></button>
+                        <button type="button" class="btn btn-outline-secondary" data-role="generate">Generate</button>
+                    </div>
+                </div>
+                <div class="d-flex align-items-center gap-2 mb-2">
+                    <div class="progress flex-grow-1" style="height:6px;" data-role="meter">
+                        <div class="progress-bar" data-role="meter-a" style="width:0"></div>
+                        <div class="progress-bar" data-role="meter-b" style="width:0"></div>
+                        <div class="progress-bar" data-role="meter-c" style="width:0"></div>
+                        <div class="progress-bar" data-role="meter-d" style="width:0"></div>
+                    </div>
+                    <span class="x-small text-muted" data-role="meter-text">Too short</span>
+                </div>
+                <p class="x-small text-muted">
+                    At least 10 characters, not the customer's name or email. Not emailed —
+                    you pass it on. They must change it at next sign-in.
+                </p>
+                <button type="submit" class="btn btn-primary" data-role="submit" disabled>Set password</button>
+            </div>
+            <div class="d-none" data-role="reset-result">
+                <label class="form-label small text-muted">New password</label>
+                <div class="input-group mb-2">
+                    <input type="text" class="form-control font-monospace" readonly
+                           data-role="result-password" value="">
+                    <button type="button" class="btn btn-outline-secondary" data-role="copy">Copy</button>
+                </div>
+                <p class="x-small text-warning-emphasis mb-0">Shown once. Copy it now.</p>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script src="<?= APP_URL ?>/assets/js/admin-password.js?v=<?= (int)@filemtime(dirname(__DIR__) . '/assets/js/admin-password.js') ?>"></script>
+
+<?php require_once dirname(__DIR__) . '/includes/admin-footer.php'; ?>

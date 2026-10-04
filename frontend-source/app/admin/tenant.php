@@ -1,0 +1,287 @@
+<?php
+// Tenant detail. Operational metadata and the tenant's own profile only —
+// message contents are NEVER surfaced to an admin, and that boundary must
+// survive every future addition to this page.
+require_once dirname(__DIR__) . '/includes/admin-init.php';
+
+$targetId = (int)($_GET['id'] ?? 0);
+
+$stmt = $conn->prepare(
+    // p.currency is selected because formatPrice() displays a price in the
+    // currency it is denominated in; omitting it would fall back to the instance
+    // currency and mislabel a plan that differs.
+    "SELECT u.*, p.name AS plan_name, p.code AS plan_code, p.price_cents,
+            p.currency, p.billing_period
+     FROM users u LEFT JOIN plans p ON u.plan_id = p.id
+     WHERE u.id = ?"
+);
+$stmt->bind_param('i', $targetId);
+$stmt->execute();
+$tenant = $stmt->get_result()->fetch_assoc();
+$stmt->close();
+
+if (!$tenant) {
+    flash('error', 'Customer not found.');
+    redirect(APP_URL . '/admin/tenants.php');
+}
+
+$profile = getUserProfile($conn, $targetId);
+$plan = getUserPlan($conn, $targetId);
+$timezone = getUserSetting($conn, $targetId, 'timezone', appTimezone($conn));
+
+$stmt = $conn->prepare(
+    "SELECT wa.id, wa.session_id, wa.provider, wa.label, wa.status, wa.phone_number,
+            wa.push_name, wa.connected_at, wa.created_at,
+            (SELECT MAX(m.message_timestamp) FROM wa_messages m
+             WHERE m.account_id = wa.id) AS last_activity
+     FROM wa_accounts wa WHERE wa.user_id = ? ORDER BY wa.created_at DESC"
+);
+$stmt->bind_param('i', $targetId);
+$stmt->execute();
+$accounts = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
+
+$usage = [
+    'WhatsApp Accounts' => [countWaAccounts($conn, $targetId), planLimit($plan, 'max_wa_accounts')],
+    'Contacts'          => [countContacts($conn, $targetId), planLimit($plan, 'max_contacts')],
+    'Messages Sent'     => [usageCount($conn, $targetId, 'messages_sent'), planLimit($plan, 'max_messages_per_month')],
+    // Shown unconditionally here, unlike on the tenant's own billing page: an
+    // admin looking at a support ticket needs to see a zero-of-zero allowance,
+    // because "their plan has no AI replies" is frequently the answer.
+    'AI Credits'        => [usageCount($conn, $targetId, 'chatbot_replies'), planLimit($plan, 'max_chatbot_replies')],
+    'Bookable Services' => [countServices($conn, $targetId), planLimit($plan, 'max_services')],
+];
+
+// Recent activity for this tenant. Actions only — never content.
+$stmt = $conn->prepare(
+    "SELECT action, entity, entity_id, ip_address, created_at
+     FROM audit_log WHERE user_id = ? ORDER BY id DESC LIMIT 20"
+);
+$stmt->bind_param('i', $targetId);
+$stmt->execute();
+$audit = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
+
+$pageTitle = 'Customer — ' . tenantDisplayName($tenant, $profile);
+
+// The detail, on its own, for the modal on admin/tenants.php to load (#49).
+//
+// Sent only in reply to our own fetch() — X-Requested-With is the test — so a
+// normal page load is unaffected and clicking a tenant name with JavaScript off
+// still gets the whole page. requireAdmin() has already run, from
+// admin-init.php, before the tenant was even looked up: the fragment is not a
+// second, laxer route to the same data.
+$fragment = isXhrRequest();
+
+if (!$fragment) {
+    require_once dirname(__DIR__) . '/includes/admin-header.php';
+    ?>
+    <div class="page-toolbar">
+        <div>
+            <p class="page-toolbar-title">
+                <?= sanitize(tenantDisplayName($tenant, $profile)) ?>
+                <?php if (!$tenant['is_active']): ?>
+                    <span class="badge bg-secondary">Not activated</span>
+                <?php elseif ($tenant['status'] === 'suspended'): ?>
+                    <span class="badge bg-danger">Suspended</span>
+                <?php else: ?>
+                    <span class="badge bg-success">Active</span>
+                <?php endif; ?>
+                <?php if ($tenant['is_admin']): ?><span class="badge bg-dark">Admin</span><?php endif; ?>
+            </p>
+            <p class="page-toolbar-subtitle">
+                <?= sanitize($tenant['email']) ?> · <code>t<?= (int)$tenant['id'] ?></code>
+            </p>
+        </div>
+        <div class="page-toolbar-actions">
+            <a href="<?= APP_URL ?>/admin/tenants.php" class="btn btn-sm btn-outline-secondary">
+                <i class="bi bi-arrow-left me-1"></i>All customers
+            </a>
+        </div>
+    </div>
+    <?php
+}
+?>
+
+<div class="row g-4">
+    <div class="col-lg-5">
+        <div class="card mb-4">
+            <div class="card-header">Account</div>
+            <div class="card-body">
+                <dl class="row small mb-0">
+                    <dt class="col-5 text-muted fw-normal">Name</dt>
+                    <dd class="col-7"><?= sanitize($tenant['name']) ?></dd>
+                    <dt class="col-5 text-muted fw-normal">Email</dt>
+                    <dd class="col-7"><?= sanitize($tenant['email']) ?></dd>
+                    <dt class="col-5 text-muted fw-normal">Customer ID</dt>
+                    <dd class="col-7"><code>t<?= (int)$tenant['id'] ?></code></dd>
+                    <dt class="col-5 text-muted fw-normal">Status</dt>
+                    <dd class="col-7">
+                        <?php if (!$tenant['is_active']): ?>
+                            <span class="badge bg-secondary">Not activated</span>
+                        <?php elseif ($tenant['status'] === 'suspended'): ?>
+                            <span class="badge bg-danger">Suspended</span>
+                        <?php else: ?>
+                            <span class="badge bg-success">Active</span>
+                        <?php endif; ?>
+                        <?php if ($tenant['is_admin']): ?><span class="badge bg-dark">Admin</span><?php endif; ?>
+                    </dd>
+                    <dt class="col-5 text-muted fw-normal">Plan</dt>
+                    <dd class="col-7"><?= sanitize($tenant['plan_name'] ?? '—') ?>
+                        <span class="text-muted">(<?= sanitize(formatPrice($tenant)) ?>)</span></dd>
+                    <dt class="col-5 text-muted fw-normal">Timezone</dt>
+                    <dd class="col-7"><?= sanitize($timezone) ?> <span class="text-muted"><?= sanitize(timezoneOffsetLabel($timezone)) ?></span></dd>
+                    <dt class="col-5 text-muted fw-normal">Registered</dt>
+                    <dd class="col-7"><?= date('M j, Y', strtotime($tenant['created_at'])) ?></dd>
+                    <dt class="col-5 text-muted fw-normal">Last login</dt>
+                    <dd class="col-7"><?= $tenant['last_login_at'] ? sanitize(timeAgo($tenant['last_login_at'])) : '—' ?></dd>
+                </dl>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">Profile</div>
+            <div class="card-body">
+                <?php if (!hasProfileDetail($profile)): ?>
+                    <p class="text-muted small mb-0">This customer has not completed their profile.</p>
+                <?php else: ?>
+                    <dl class="row small mb-0">
+                        <?php if ($profile['company_name']): ?>
+                            <dt class="col-5 text-muted fw-normal">Company</dt>
+                            <dd class="col-7"><?= sanitize($profile['company_name']) ?></dd>
+                        <?php endif; ?>
+                        <?php if ($profile['whatsapp_number']): ?>
+                            <dt class="col-5 text-muted fw-normal">WhatsApp</dt>
+                            <dd class="col-7"><?= sanitize(formatPhone($profile['whatsapp_number'])) ?></dd>
+                        <?php endif; ?>
+                        <?php $lines = addressLines($profile); ?>
+                        <?php if ($lines): ?>
+                            <dt class="col-5 text-muted fw-normal">Address</dt>
+                            <dd class="col-7"><?= implode('<br>', array_map('sanitize', $lines)) ?></dd>
+                        <?php endif; ?>
+                        <dt class="col-5 text-muted fw-normal">Contact by</dt>
+                        <dd class="col-7">
+                            <?php
+                            $prefs = array_filter([
+                                (int)$profile['contact_email'] === 1 ? 'Email' : null,
+                                (int)$profile['contact_whatsapp'] === 1 ? 'WhatsApp' : null,
+                            ]);
+                            echo $prefs ? sanitize(implode(', ', $prefs)) : '<span class="text-muted">No contact permitted</span>';
+                            ?>
+                        </dd>
+                    </dl>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-7">
+        <div class="card mb-4">
+            <div class="card-header">Usage this month</div>
+            <div class="card-body">
+                <?php foreach ($usage as $label => [$used, $limit]): ?>
+                    <div class="small mb-3">
+                        <div class="d-flex justify-content-between">
+                            <span class="fw-500"><?= sanitize($label) ?></span>
+                            <span class="text-muted"><?= number_format($used) ?> / <?= sanitize(formatLimit($limit)) ?></span>
+                        </div>
+                        <?php // The numbers already say how much is used; the bar says how
+                              // much room is left. Only finite limits get one — "Unlimited"
+                              // cannot be drawn, and a 0 limit is drawn full rather than
+                              // divided by. ?>
+                        <?php if ($limit !== null): ?>
+                            <?php $pct = $limit > 0 ? min(100, (int)round($used / $limit * 100)) : 100; ?>
+                            <div class="progress mt-1" style="height:6px;">
+                                <div class="progress-bar" role="progressbar" style="width:<?= $pct ?>%"
+                                     aria-valuenow="<?= $pct ?>" aria-valuemin="0" aria-valuemax="100"></div>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                <?php endforeach; ?>
+                <?php // #20: sends made on the tenant's own phone, relayed by the
+                      // linked device — informational, never metered. ?>
+                <div class="x-small text-muted">
+                    Sent from their phone this month:
+                    <?= number_format(usageCount($conn, $targetId, 'messages_sent_device')) ?>
+                    (not counted toward the limit).
+                </div>
+            </div>
+        </div>
+
+        <div class="card mb-4 table-card">
+            <div class="card-header">WhatsApp accounts</div>
+            <?php if (!$accounts): ?>
+                <div class="card-body"><p class="text-muted small mb-0">This customer has not linked a WhatsApp account.</p></div>
+            <?php else: ?>
+            <div class="table-responsive">
+                <table class="table align-middle mb-0 table-stack">
+                    <thead><tr><th>Label</th><th>Number</th><th>Status</th><th>Connected</th><th>Last activity</th><th>Actions</th></tr></thead>
+                    <tbody>
+                    <?php foreach ($accounts as $a): ?>
+                        <tr>
+                            <td class="small" data-label="Label"><?= sanitize($a['label'] ?: '—') ?></td>
+                            <td class="small" data-label="Number"><?= $a['phone_number'] ? sanitize(formatPhone($a['phone_number'])) : '—' ?></td>
+                            <td data-label="Status"><span class="badge-status <?= waStatusClass($a['status']) ?>"><?= sanitize(waStatusLabel($a['status'])) ?></span></td>
+                            <td class="small text-muted" data-label="Connected"><?= $a['connected_at'] ? sanitize(timeAgo($a['connected_at'])) : '—' ?></td>
+                            <td class="small text-muted" data-label="Last activity"><?= $a['last_activity'] ? sanitize(timeAgo($a['last_activity'])) : '—' ?></td>
+                            <td data-label="Actions">
+                                <?php // Cloud rows have no socket to park — there is no pause
+                                      // to offer. The form posts to tenants.php (which owns
+                                      // every mutating admin action) even when this table is
+                                      // rendered inside the fragment loaded by its modal;
+                                      // forms.js's delegated submit handler picks it up there
+                                      // and the default reload redraws the badge. ?>
+                                <?php if (($a['provider'] ?? 'baileys') !== 'cloud'): ?>
+                                <form method="POST" action="<?= APP_URL ?>/admin/tenants.php" class="d-inline" data-ajax>
+                                    <?= csrfField() ?>
+                                    <input type="hidden" name="account_id" value="<?= (int)$a['id'] ?>">
+                                    <?php if ($a['status'] === 'paused'): ?>
+                                        <input type="hidden" name="action" value="resume_wa">
+                                        <button class="btn btn-sm btn-outline-success" <?= $tenant['status'] === 'suspended' ? 'disabled title="Reactivate the customer first"' : '' ?>>Resume</button>
+                                    <?php else: ?>
+                                        <input type="hidden" name="action" value="pause_wa">
+                                        <button class="btn btn-sm btn-outline-secondary"
+                                                data-confirm="Pause this connection? The customer's bot will not reply and messages will not be received until it is resumed.">Pause</button>
+                                    <?php endif; ?>
+                                </form>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php endif; ?>
+        </div>
+
+        <div class="card table-card">
+            <div class="card-header">Recent activity</div>
+            <?php if (!$audit): ?>
+                <div class="card-body"><p class="text-muted small mb-0">No administrative activity has been recorded for this customer.</p></div>
+            <?php else: ?>
+            <div class="table-responsive">
+                <table class="table align-middle mb-0 table-stack">
+                    <thead><tr><th>Action</th><th>Entity</th><th>IP</th><th>When</th></tr></thead>
+                    <tbody>
+                    <?php foreach ($audit as $row): ?>
+                        <tr>
+                            <td class="small" data-label="Action"><code><?= sanitize($row['action']) ?></code></td>
+                            <td class="small text-muted" data-label="Entity"><?= sanitize(trim(($row['entity'] ?? '') . ' ' . ($row['entity_id'] ?? ''))) ?: '—' ?></td>
+                            <td class="small text-muted" data-label="IP"><?= sanitize($row['ip_address'] ?? '—') ?></td>
+                            <td class="small text-muted" data-label="When"><?= sanitize(timeAgo($row['created_at'])) ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+</div>
+
+<?php
+// The fragment stops here: a modal body must not be handed a </body> or a
+// second copy of the page's scripts.
+if ($fragment) exit;
+require_once dirname(__DIR__) . '/includes/admin-footer.php';
+?>
